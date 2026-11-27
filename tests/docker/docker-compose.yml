@@ -1,0 +1,154 @@
+name: fable-resolver-test
+
+x-broker-env: &broker-env
+  AMQP_URL: amqp://guest:guest@amqp:5672//
+  REDIS_URL: redis://redis:6379/0
+  NEO4J_URL: bolt://neo4j:7687
+  PPRL_SERVICE_BASE_URL: http://pprl-service:8080
+
+
+services:
+
+  postgresql:
+    image: postgres:17
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: root
+      TZ: Europe/Berlin
+    volumes:
+      - ./gpas/postgres-sqls:/docker-entrypoint-initdb.d
+    command:
+      - "-cmax_connections=100"
+      - "-cshared_buffers=512MB"
+      - "-ceffective_cache_size=5GB"
+
+  gpas:
+    image: mosaicgreifswald/gpas:2026.1.1
+    ports:
+      - "8787:8787"
+      - "8083:8080"
+      - "9990:9990"
+    environment:
+      TTP_DB_DBMS: postgresql
+      WF_WAIT_FOR_PORTS: postgresql:5432:120
+      WF_HEALTHCHECK_URLS: |
+        http://localhost:8080
+        http://localhost:8080/gpas-rest/health/state
+    depends_on:
+      - postgresql
+
+  mariadb:
+    image: mariadb:11
+    ports:
+      - "3306:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      TZ: Europe/Berlin
+    volumes:
+      - ./epix/mariadb-sqls:/docker-entrypoint-initdb.d
+    command:
+      - "--max_allowed_packet=20M"
+      - "--default-time-zone=Europe/Berlin"
+      - "--innodb_buffer_pool_size=2G"
+
+  epix:
+    image: mosaicgreifswald/epix:2026.1.1
+    ports:
+      - "8788:8787"
+      - "8082:8080"
+      - "9991:9990"
+    environment:
+      TTP_DB_DBMS: mariadb
+      WF_WAIT_FOR_PORTS: mariadb:3306:120
+      WF_HEALTHCHECK_URLS: |
+        http://localhost:8080
+        http://localhost:8080/epix-rest/health/state
+    depends_on:
+      - mariadb
+
+  neo4j:
+    image: neo4j:5.26.27-community
+    environment:
+      - NEO4J_AUTH=none
+    ports:
+      - "7474:7474"  # HTTP access and web interface
+      - "7687:7687"  # Bolt interface
+    healthcheck:
+      test: [ "CMD", "cypher-shell", "RETURN 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  amqp:
+    image: rabbitmq:3.13.7
+    ports:
+      - "5672:5672"
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:8.6.4
+    ports:
+      - "6379:6379"
+    command: redis-server --notify-keyspace-events Ex
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  pprl-service:
+    image: ghcr.io/ul-mds/fable-pprl-service
+    pull_policy: always
+    environment:
+      - ROLE=both
+    ports:
+      - "8080:8080"
+
+  broker-worker:
+    image: ghcr.io/ul-mds/fable-broker
+    pull_policy: always
+    command: [ "celery", "-A", "fable_broker.worker.celery", "worker", "--loglevel", "INFO" ]
+    depends_on:
+      amqp:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      pprl-service:
+        condition: service_healthy
+    environment:
+      <<: *broker-env
+    healthcheck:
+      test: [ "CMD", "celery", "-A", "fable_broker.worker.celery", "inspect", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  broker-api:
+    image: ghcr.io/ul-mds/fable-broker
+    pull_policy: always
+    command: [ "uvicorn", "fable_broker.server:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--log-config", "config/logging.yaml" ]
+    depends_on:
+      broker-worker:
+        condition: service_healthy
+    environment:
+      <<: *broker-env
+      TASK_CLEANUP_INTERVAL: 2
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:8080/health'); sys.exit(0)" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
